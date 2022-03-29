@@ -63,6 +63,7 @@ var listenAddressFmt string
 var listenAddress = "127.0.0.1"
 var proxyOnly bool
 var customPort = 0
+var persistent bool
 
 func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	cmd := &cobra.Command{
@@ -79,6 +80,7 @@ func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	cmd.Flags().BoolVar(&proxyOnly, "proxy-only", proxyOnly, "--proxy-only=false: Setting this true will run only the virtctl vnc proxy and show the port where VNC viewers can connect")
 	cmd.Flags().IntVar(&customPort, "port", customPort,
 		"--port=0: Assigning a port value to this will try to run the proxy on the given port if the port is accessible; If unassigned, the proxy will run on a random port")
+	cmd.Flags().BoolVar(&persistent, "persistent", persistent, "--persistent=false: Setting this true will keep the VNC proxy open indefinitely")
 	cmd.SetUsageTemplate(templates.UsageTemplate())
 	return cmd
 }
@@ -101,122 +103,140 @@ func (o *VNC) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// setup connection with VM
-	vnc, err := virtCli.VirtualMachineInstance(namespace).VNC(vmi)
-	if err != nil {
-		return fmt.Errorf("Can't access VMI %s: %s", vmi, err.Error())
-	}
-	// Format the listening address to account for the port (ex: 127.0.0.0:5900)
-	// Set listenAddress to localhost if proxy-only flag is not set
-	if !proxyOnly {
-		listenAddress = "127.0.0.1"
-		glog.V(2).Infof("--proxy-only is set to false, listening on %s\n", listenAddress)
-	}
-	listenAddressFmt = listenAddress + ":%d"
-	lnAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(listenAddressFmt, customPort))
-	if err != nil {
-		return fmt.Errorf("Can't resolve the address: %s", err.Error())
-	}
 
-	// The local tcp server is used to proxy the podExec websock connection to vnc client
-	ln, err := net.ListenTCP("tcp", lnAddr)
-	if err != nil {
-		return fmt.Errorf("Can't listen on unix socket: %s", err.Error())
-	}
-	// End of pre-flight checks. Everything looks good, we can start
-	// the goroutines and let the data flow
-
-	//                                       -> pipeInWriter  -> pipeInReader
-	// remote-viewer -> unix sock connection
-	//                                       <- pipeOutReader <- pipeOutWriter
-	pipeInReader, pipeInWriter := io.Pipe()
-	pipeOutReader, pipeOutWriter := io.Pipe()
-
-	k8ResChan := make(chan error)
-	listenResChan := make(chan error)
-	viewResChan := make(chan error)
 	stopChan := make(chan struct{}, 1)
 	doneChan := make(chan struct{}, 1)
-	writeStop := make(chan error)
-	readStop := make(chan error)
 
-	go func() {
-		// transfer data from/to the VM
-		k8ResChan <- vnc.Stream(kubecli.StreamOptions{
-			In:  pipeInReader,
-			Out: pipeOutWriter,
-		})
-	}()
-
-	// wait for vnc client to connect to our local proxy server
-	go func() {
-		start := time.Now()
-		glog.Infof("connection timeout: %v", LISTEN_TIMEOUT)
-		// Don't set deadline if only proxy is running and VNC is to be connected manually
-		if !proxyOnly {
-			// exit early if spawning vnc client fails
-			ln.SetDeadline(time.Now().Add(LISTEN_TIMEOUT))
-		}
-		fd, err := ln.Accept()
+	for ok := true; ok; ok = persistent {
+		vnc, err := virtCli.VirtualMachineInstance(namespace).VNC(vmi)
 		if err != nil {
-			glog.V(2).Infof("Failed to accept unix sock connection. %s", err.Error())
-			listenResChan <- err
+			return fmt.Errorf("Can't access VMI %s: %s", vmi, err.Error())
 		}
-		defer fd.Close()
+		// Format the listening address to account for the port (ex: 127.0.0.0:5900)
+		// Set listenAddress to localhost if proxy-only flag is not set
+		if !proxyOnly {
+			listenAddress = "127.0.0.1"
+			glog.V(2).Infof("--proxy-only is set to false, listening on %s\n", listenAddress)
+		}
+		listenAddressFmt = listenAddress + ":%d"
+		lnAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(listenAddressFmt, customPort))
+		if err != nil {
+			return fmt.Errorf("Can't resolve the address: %s", err.Error())
+		}
 
-		glog.V(2).Infof("VNC Client connected in %v", time.Now().Sub(start))
-		templates.PrintWarningForPausedVMI(virtCli, vmi, namespace)
+		// The local tcp server is used to proxy the podExec websock connection to vnc client
+		ln, err := net.ListenTCP("tcp", lnAddr)
+		if err != nil {
+			return fmt.Errorf("Can't listen on unix socket: %s", err.Error())
+		}
+		// End of pre-flight checks. Everything looks good, we can start
+		// the goroutines and let the data flow
 
-		// write to FD <- pipeOutReader
+		//                                       -> pipeInWriter  -> pipeInReader
+		// remote-viewer -> unix sock connection
+		//                                       <- pipeOutReader <- pipeOutWriter
+		pipeInReader, pipeInWriter := io.Pipe()
+		pipeOutReader, pipeOutWriter := io.Pipe()
+
+		k8ResChan := make(chan error)
+		listenResChan := make(chan error)
+		viewResChan := make(chan error)
+		writeStop := make(chan error)
+		readStop := make(chan error)
+
 		go func() {
-			_, err := io.Copy(fd, pipeOutReader)
-			readStop <- err
+			// transfer data from/to the VM
+			k8ResChan <- vnc.Stream(kubecli.StreamOptions{
+				In:  pipeInReader,
+				Out: pipeOutWriter,
+			})
 		}()
 
-		// read from FD -> pipeInWriter
+		// wait for vnc client to connect to our local proxy server
 		go func() {
-			_, err := io.Copy(pipeInWriter, fd)
-			writeStop <- err
+			start := time.Now()
+			glog.Infof("connection timeout: %v", LISTEN_TIMEOUT)
+			// Don't set deadline if only proxy is running and VNC is to be connected manually
+			if !proxyOnly {
+				// exit early if spawning vnc client fails
+				ln.SetDeadline(time.Now().Add(LISTEN_TIMEOUT))
+			}
+			fd, err := ln.Accept()
+			if err != nil {
+				glog.V(2).Infof("Failed to accept unix sock connection. %s", err.Error())
+				listenResChan <- err
+			}
+			defer fd.Close()
+
+			glog.V(2).Infof("VNC Client connected in %v", time.Now().Sub(start))
+			templates.PrintWarningForPausedVMI(virtCli, vmi, namespace)
+
+			// write to FD <- pipeOutReader
+			go func() {
+				_, err := io.Copy(fd, pipeOutReader)
+				readStop <- err
+			}()
+
+			// read from FD -> pipeInWriter
+			go func() {
+				_, err := io.Copy(pipeInWriter, fd)
+				writeStop <- err
+			}()
+
+			// don't terminate until vnc client is done
+			<-doneChan
+			listenResChan <- err
 		}()
 
-		// don't terminate until vnc client is done
-		<-doneChan
-		listenResChan <- err
-	}()
+		port := ln.Addr().(*net.TCPAddr).Port
 
-	port := ln.Addr().(*net.TCPAddr).Port
+		if proxyOnly {
+			defer close(doneChan)
+			optionString, err := json.Marshal(struct {
+				Port int `json:"port"`
+			}{port})
+			if err != nil {
+				return fmt.Errorf("Error encountered: %s", err.Error())
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), string(optionString))
+		} else {
+			// execute VNC Viewer
+			go checkAndRunVNCViewer(doneChan, viewResChan, port)
+		}
 
-	if proxyOnly {
-		defer close(doneChan)
-		optionString, err := json.Marshal(struct {
-			Port int `json:"port"`
-		}{port})
+		go func() {
+			defer close(stopChan)
+			interrupt := make(chan os.Signal, 1)
+			signal.Notify(interrupt, os.Interrupt)
+			<-interrupt
+			// Exit the loop
+			glog.V(2).Infof("Received interrupt signal, exiting")
+			// Signal the goroutine to stop
+			doneChan <- struct{}{}
+
+		}()
+
+		select {
+		case <-stopChan:
+		case err = <-readStop:
+		case err = <-writeStop:
+		case err = <-k8ResChan:
+		case err = <-viewResChan:
+		case err = <-listenResChan:
+		}
+
 		if err != nil {
 			return fmt.Errorf("Error encountered: %s", err.Error())
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), string(optionString))
-	} else {
-		// execute VNC Viewer
-		go checkAndRunVNCViewer(doneChan, viewResChan, port)
-	}
-
-	go func() {
-		defer close(stopChan)
-		interrupt := make(chan os.Signal, 1)
-		signal.Notify(interrupt, os.Interrupt)
-		<-interrupt
-	}()
-
-	select {
-	case <-stopChan:
-	case err = <-readStop:
-	case err = <-writeStop:
-	case err = <-k8ResChan:
-	case err = <-viewResChan:
-	case err = <-listenResChan:
-	}
-
-	if err != nil {
-		return fmt.Errorf("Error encountered: %s", err.Error())
+		glog.V(2).Infof("Client disconnected")
+		// Close/unbind port/address
+		ln.Close()
+		// Close the pipes
+		pipeInWriter.Close()
+		pipeOutReader.Close()
+		// Close the VNC connection
+		vnc.AsConn().Close()
+		glog.V(2).Infof("Cleaned up TCP connection")
 	}
 	return nil
 }
@@ -328,5 +348,5 @@ func remoteViewerArgs(port int) (args []string) {
 
 func usage() string {
 	return `  # Connect to 'testvmi' via remote-viewer:\n"
-   {{ProgramName}} vnc testvmi`
+			{{ProgramName}} vnc testvmi`
 }
